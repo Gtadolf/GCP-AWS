@@ -1,0 +1,180 @@
+service: gdax-lambda-arch-${self:provider.stage}
+# Custom Variables
+frameworkVersion: '2'
+custom:
+  ENV:
+    - dev
+    - qas
+    - prd
+
+provider:
+  name: aws
+  runtime: python3.6
+  lambdaHashingVersion: 20201221
+  stage: 'dev'
+  region: 'us-east-1'
+  iamRoleStatements:
+    - Effect: "Allow"
+      Action:
+        - "s3:GetObject"
+        - "s3:ListBucket"
+        - "s3:PutObject"
+      Resource:
+        - "arn:aws:s3:::brianz-gdax-${self:provider.stage}-firehose"
+        - "arn:aws:s3:::brianz-gdax-${self:provider.stage}-firehose/*"
+        - "arn:aws:s3:::brianz-gdax-${self:provider.stage}-results"
+        - "arn:aws:s3:::brianz-gdax-${self:provider.stage}-results/*"
+    - Effect: "Allow"
+      Action:
+        - "dynamodb:PutItem"
+      Resource: "arn:aws:dynamodb:${self:provider.region}:*:table/brianz-gdax-${self:provider.stage}-realtime"
+  
+
+
+package:
+  exclude:
+    - .git/**
+    - __pycache__/**
+    - "**/__pycache__/**"
+    - "*.pyc"
+    - "*.swp"
+
+
+resources:
+  Resources:
+    # This is the stream which the producer will write to. Any writes will trigger a lambda
+    # function. The Lambda function will need read access to this stream.
+    GdaxKinesisStream:
+      Type: AWS::Kinesis::Stream
+      Properties:
+        Name: brianz-gdax-${self:provider.stage}-kinesis-stream
+        RetentionPeriodHours: 24
+        ShardCount: 1
+    # The firehose stream will be used to batch write data to S3 every 60s. The data source for
+    # this firehose stream is the main kinesis stream above.
+    # We need to allow for firehose to read from the primary stream, and write to the s3 bucket.
+    GdaxKinesisFirehoseStream:
+      Type: AWS::KinesisFirehose::DeliveryStream
+      # This DependsOn attribute is a bit of a hack. Severless does not add this automatically and
+      # the initial deployment fails if the S3 destination bucket is not created before this stream
+      # is created.
+      DependsOn:
+        - S3BucketBrianzgdax${self:provider.stage}firehose
+      Properties:
+        DeliveryStreamName: brianz-gdax-${self:provider.stage}-fh-stream
+        DeliveryStreamType: KinesisStreamAsSource
+        KinesisStreamSourceConfiguration:
+          KinesisStreamARN:
+            Fn::GetAtt:
+              - GdaxKinesisStream
+              - Arn
+          RoleARN:
+            Fn::GetAtt:
+              - GdaxFirehoseRole
+              - Arn
+        S3DestinationConfiguration:
+          BucketARN: "arn:aws:s3:::brianz-gdax-${self:provider.stage}-firehose"
+          BufferingHints:
+            IntervalInSeconds: 60
+            SizeInMBs: 5
+          CompressionFormat: UNCOMPRESSED
+          RoleARN:
+            Fn::GetAtt:
+              - GdaxFirehoseRole
+              - Arn
+    GdaxFirehoseRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: gdax_${self:provider.stage}_firehose_delivery_role
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - firehose.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        Path: /
+        Policies:
+          - PolicyName: ${self:provider.stage}_gdax_firehose_policy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:AbortMultipartUpload
+                    - s3:GetBucketLocation
+                    - s3:GetObject
+                    - s3:ListBucket
+                    - s3:ListBucketMultipartUploads
+                    - s3:PutObject
+                  Resource:
+                    - "arn:aws:s3:::brianz-gdax-${self:provider.stage}-firehose"
+                    - "arn:aws:s3:::brianz-gdax-${self:provider.stage}-firehose/*"
+                - Effect: Allow
+                  Action:
+                    - kinesis:DescribeStream
+                    - kinesis:GetRecords
+                    - kinesis:GetShardIterator
+                    - kinesis:ListStreams
+                  Resource:
+                    - "arn:aws:kinesis:${self:provider.region}:*:stream/brianz-gdax-${self:provider.stage}-kinesis-stream"
+    GdaxRealtimeTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: brianz-gdax-${self:provider.stage}-realtime
+        AttributeDefinitions:
+          - AttributeName: productTrade
+            AttributeType: S
+        KeySchema:
+          - AttributeName: productTrade
+            KeyType: HASH
+        ProvisionedThroughput:
+          ReadCapacityUnits: 1
+          WriteCapacityUnits: 1
+
+functions:
+  ProcessPrice:
+    handler: handler.single
+    memorySize: 256
+    timeout: 3
+    events:
+      - stream:
+          type: kinesis
+          arn:
+            Fn::GetAtt:
+              - GdaxKinesisStream
+              - Arn
+    environment:
+      TABLE_NAME: brianz-gdax-${self:provider.stage}-realtime
+  CalculateMinuteView:
+    handler: handler.minute
+    memorySize: 256
+    timeout: 10
+    events:
+      - s3:
+          bucket: brianz-gdax-${self:provider.stage}-firehose
+          event: s3:ObjectCreated:*
+    environment:
+      DESTINATION_BUCKET: brianz-gdax-${self:provider.stage}-results
+  CalculateHourlyView:
+    handler: handler.hourly
+    memorySize: 512
+    timeout: 60
+    events:
+      - s3:
+          bucket: brianz-gdax-${self:provider.stage}-results
+          event: s3:ObjectCreated:*
+          rules:
+            - suffix: '59-minute.json'
+  CalculateDailyView:
+    handler: handler.daily
+    memorySize: 1024
+    timeout: 300
+    events:
+      - s3:
+          bucket: brianz-gdax-${self:provider.stage}-results
+          event: s3:ObjectCreated:*
+          rules:
+            - suffix: '23-hour.json'
